@@ -8923,5 +8923,143 @@ routeCmd.command('info')
     console.log('');
   });
 
+// ── Decompile Command ──────────────────────────────────────────────────────
+const decompileCmd = program
+  .command('decompile [target]')
+  .description('Decompile npm packages, local JS files, or URLs into modules')
+  .option('-o, --output <dir>', 'Output directory')
+  .option('-f, --format <type>', 'Output format: modules, single, json', 'modules')
+  .option('-c, --confidence <n>', 'Minimum confidence threshold (0-1)', '0.3')
+  .option('--no-witness', 'Skip witness chain generation')
+  .option('--json', 'JSON output to stdout (for piping)')
+  .option('-q, --quiet', 'Suppress progress output')
+  .option('--version-pkg <ver>', 'Package version (alternative to @version syntax)')
+  .option('--diff <version>', 'Compare against another version')
+  .action(async (target, opts) => {
+    if (!target) {
+      console.log(chalk.cyan('\nUsage:'));
+      console.log(chalk.white('  ruvector decompile <package>           Decompile npm package'));
+      console.log(chalk.white('  ruvector decompile <pkg>@<ver>         Specific version'));
+      console.log(chalk.white('  ruvector decompile ./bundle.js         Local file'));
+      console.log(chalk.white('  ruvector decompile https://unpkg.com/x URL'));
+      console.log(chalk.dim('\nOptions:'));
+      console.log(chalk.dim('  -o, --output <dir>     Output directory'));
+      console.log(chalk.dim('  -f, --format <type>    modules | single | json'));
+      console.log(chalk.dim('  -c, --confidence <n>   Min confidence (0-1, default: 0.3)'));
+      console.log(chalk.dim('  --no-witness           Skip witness chain'));
+      console.log(chalk.dim('  --json                 JSON to stdout'));
+      console.log(chalk.dim('  --diff <version>       Diff against another version'));
+      console.log('');
+      return;
+    }
+
+    const decompiler = require('../src/decompiler/index.js');
+    const { parseTarget } = decompiler;
+    const parsed = parseTarget(target);
+    const minConfidence = parseFloat(opts.confidence);
+    const decompileOpts = { minConfidence, witness: opts.witness !== false };
+    const quiet = opts.quiet || opts.json;
+    let spinner = null;
+
+    if (!quiet) {
+      spinner = ora('Analyzing target...').start();
+    }
+
+    try {
+      let result;
+
+      if (parsed.type === 'npm') {
+        const version = opts.versionPkg || parsed.version;
+        if (!quiet) spinner.text = `Fetching ${parsed.name}${version ? '@' + version : ''}...`;
+        result = await decompiler.decompilePackage(parsed.name, version, decompileOpts);
+        if (!quiet) spinner.text = `Decompiled ${result.packageInfo.name}@${result.packageInfo.version}`;
+      } else if (parsed.type === 'file') {
+        if (!quiet) spinner.text = `Reading ${parsed.path}...`;
+        result = decompiler.decompileFile(parsed.path, decompileOpts);
+      } else if (parsed.type === 'url') {
+        if (!quiet) spinner.text = `Fetching ${parsed.url}...`;
+        result = await decompiler.decompileUrl(parsed.url, decompileOpts);
+      }
+
+      if (!quiet) spinner.succeed(chalk.green('Decompilation complete'));
+
+      // Handle --diff flag
+      if (opts.diff && parsed.type === 'npm') {
+        if (!quiet) {
+          const diffSpinner = ora(`Fetching ${parsed.name}@${opts.diff} for diff...`).start();
+          try {
+            const other = await decompiler.decompilePackage(parsed.name, opts.diff, decompileOpts);
+            diffSpinner.succeed('Diff complete');
+            const resultNames = new Set(result.modules.map((m) => m.name));
+            const otherNames = new Set(other.modules.map((m) => m.name));
+            const added = [...resultNames].filter((n) => !otherNames.has(n));
+            const removed = [...otherNames].filter((n) => !resultNames.has(n));
+            const common = [...resultNames].filter((n) => otherNames.has(n));
+
+            console.log(chalk.bold.cyan('\n  Version Diff'));
+            console.log(chalk.white(`  ${opts.diff} -> ${result.packageInfo.version}`));
+            if (added.length) console.log(chalk.green(`  Added:   ${added.join(', ')}`));
+            if (removed.length) console.log(chalk.red(`  Removed: ${removed.join(', ')}`));
+            console.log(chalk.dim(`  Common:  ${common.length} modules`));
+            console.log('');
+          } catch (err) {
+            diffSpinner.fail(`Diff failed: ${err.message}`);
+          }
+        }
+      }
+
+      // Output
+      if (opts.json) {
+        const jsonOut = {
+          modules: result.modules.map((m) => ({
+            name: m.name, fragments: m.fragments, confidence: m.confidence,
+            contentLength: m.content.length,
+          })),
+          metrics: result.metrics,
+          witness: result.witness ? { root: result.witness.root, chain_length: result.witness.chain.length } : null,
+          packageInfo: result.packageInfo || null,
+        };
+        console.log(JSON.stringify(jsonOut, null, 2));
+        return;
+      }
+
+      // Determine output directory
+      let outputDir = opts.output;
+      if (!outputDir) {
+        const baseName = result.packageInfo
+          ? `${result.packageInfo.name.replace('/', '-')}@${result.packageInfo.version}`
+          : path.basename(target, '.js');
+        outputDir = path.join(process.cwd(), 'decompiled', baseName);
+      }
+
+      decompiler.writeOutput(result, outputDir, opts.format);
+
+      console.log(chalk.bold.cyan('\n  Decompilation Summary'));
+      console.log(chalk.white(`  Modules:     ${result.modules.length}`));
+      console.log(chalk.white(`  Source size:  ${(result.metrics.source.sizeBytes / 1024).toFixed(1)} KB`));
+      console.log(chalk.white(`  Functions:    ${result.metrics.source.functions}`));
+      console.log(chalk.white(`  Classes:      ${result.metrics.source.classes}`));
+      if (result.witness) {
+        console.log(chalk.white(`  Witness root: ${result.witness.root.slice(0, 16)}...`));
+      }
+      console.log(chalk.green(`  Output:       ${outputDir}`));
+      console.log('');
+
+      if (result.modules.length > 0) {
+        console.log(chalk.dim('  Detected modules:'));
+        for (const mod of result.modules) {
+          const conf = (mod.confidence * 100).toFixed(0);
+          console.log(chalk.dim(`    ${mod.name} (${mod.fragments} fragments, ${conf}% confidence)`));
+        }
+        console.log('');
+      }
+    } catch (err) {
+      if (spinner) spinner.fail(chalk.red('Decompilation failed'));
+      console.error(chalk.red(`  ${err.message}`));
+      process.exit(1);
+    }
+  });
+
 program.parse();
+
 
