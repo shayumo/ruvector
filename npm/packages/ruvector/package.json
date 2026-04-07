@@ -97,7 +97,8 @@
   "peerDependencies": {
     "@ruvector/pi-brain": ">=0.1.0",
     "@ruvector/router": ">=0.1.0",
-    "@ruvector/ruvllm": ">=2.0.0"
+    "@ruvector/ruvllm": ">=2.0.0",
+    "@ruvector/diskann": ">=0.1.0"
   },
   "peerDependenciesMeta": {
     "@ruvector/pi-brain": {
@@ -107,6 +108,9 @@
       "optional": true
     },
     "@ruvector/router": {
+      "optional": true
+    },
+    "@ruvector/diskann": {
       "optional": true
     }
   },
