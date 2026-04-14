@@ -120,13 +120,15 @@ impl KnowledgeGraph {
         let embeddings: Vec<&[f32]> = memories.iter().map(|m| m.embedding.as_slice()).collect();
         let threshold = self.similarity_threshold;
 
-        // Determine dimension for early-exit heuristic
+        // Early-exit heuristic DISABLED.
+        // After L2 pre-normalization (ADR-149 followup), the partial-dot
+        // shortcut rejected too many real edges — graph collapsed from 38M
+        // to 81 edges. The full cosine is cheap enough (4x unrolled, auto-
+        // vectorized) that the early-exit wasn't saving meaningful compute.
         let dim = embeddings.first().map(|e| e.len()).unwrap_or(0);
-        // Use first quarter of dimensions for a quick rejection test.
-        // For normalised vectors, partial_dot / full_dot ~ prefix_len / dim.
-        // The factor 0.5 is conservative to avoid false negatives.
-        let prefix = dim / 4;
-        let early_exit_bound = threshold * 0.5;
+        let prefix = 0usize; // disable
+        let early_exit_bound = -1.0; // always pass
+        let _ = (dim, early_exit_bound); // suppress unused warnings
 
         // 3. Compute all edges in a single pass — O(n^2/2) pairs
         for i in 0..n {
