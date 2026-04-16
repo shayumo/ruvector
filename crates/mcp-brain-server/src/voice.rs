@@ -582,21 +582,9 @@ impl Default for InternalVoice {
 // Utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Cosine similarity between two vectors
+/// Cosine similarity — delegates to the optimized version in graph.rs
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
-    let norm_a: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    let norm_b: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-
-    if norm_a < 1e-10 || norm_b < 1e-10 {
-        return 0.0;
-    }
-
-    dot / (norm_a * norm_b)
+    crate::graph::cosine_similarity(a, b)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

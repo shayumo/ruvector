@@ -39,6 +39,9 @@ pub struct KnowledgeGraph {
 struct GraphNode {
     embedding: Vec<f32>,
     category: BrainCategory,
+    /// Mean quality score at insertion time (ADR-149 P2).
+    /// Used to skip low-quality nodes when building edges.
+    quality: f64,
 }
 
 struct GraphEdge {
@@ -62,16 +65,135 @@ impl KnowledgeGraph {
         }
     }
 
+    /// Rebuild the entire graph from a batch of memories (ADR-149 P3).
+    ///
+    /// Much faster than adding one at a time because:
+    /// 1. All nodes inserted first (no per-insert similarity scan)
+    /// 2. All-pairs similarity computed in a single pass (cache-friendly)
+    /// 3. Edges collected and stored in one allocation
+    ///
+    /// On cold start with ~10K memories this avoids ~53M sequential similarity
+    /// checks done incrementally (the i-th add_memory scans i-1 nodes) and
+    /// instead performs them in a tight loop over contiguous embedding slices.
+    pub fn rebuild_from_batch(&mut self, memories: &[BrainMemory]) {
+        self.nodes.clear();
+        self.edges.clear();
+        self.node_ids.clear();
+        self.node_index.clear();
+        self.csr_dirty = true;
+        self.csr_cache = None;
+        self.mincut = None;
+        self.sparsifier = None;
+
+        let n = memories.len();
+        if n == 0 {
+            return;
+        }
+
+        // Pre-allocate
+        self.nodes.reserve(n);
+        self.node_ids.reserve(n);
+        self.node_index.reserve(n);
+        // Heuristic: ~20 edges per node on average
+        self.edges.reserve(n * 20);
+
+        // 1. Insert all nodes and collect quality scores
+        let mut qualities = Vec::with_capacity(n);
+        for (idx, m) in memories.iter().enumerate() {
+            let quality = m.quality_score.mean();
+            let node = GraphNode {
+                embedding: m.embedding.clone(),
+                category: m.category.clone(),
+                quality,
+            };
+            self.nodes.insert(m.id, node);
+            self.node_index.insert(m.id, idx);
+            self.node_ids.push(m.id);
+            qualities.push(quality);
+        }
+
+        // ADR-149 P2: quality floor for edge building (same as add_memory)
+        const EDGE_QUALITY_FLOOR: f64 = 0.01;
+
+        // 2. Collect embeddings as slices for cache-friendly access
+        //    (avoids HashMap lookups in the hot loop)
+        let embeddings: Vec<&[f32]> = memories.iter().map(|m| m.embedding.as_slice()).collect();
+        let threshold = self.similarity_threshold;
+
+        // Early-exit heuristic DISABLED.
+        // After L2 pre-normalization (ADR-149 followup), the partial-dot
+        // shortcut rejected too many real edges — graph collapsed from 38M
+        // to 81 edges. The full cosine is cheap enough (4x unrolled, auto-
+        // vectorized) that the early-exit wasn't saving meaningful compute.
+        let dim = embeddings.first().map(|e| e.len()).unwrap_or(0);
+        let prefix = 0usize; // disable
+        let early_exit_bound = -1.0; // always pass
+        let _ = (dim, early_exit_bound); // suppress unused warnings
+
+        // 3. Compute all edges in a single pass — O(n^2/2) pairs
+        for i in 0..n {
+            // Skip low-quality source nodes
+            if qualities[i] < EDGE_QUALITY_FLOOR {
+                continue;
+            }
+            let emb_i = embeddings[i];
+            for j in (i + 1)..n {
+                // Skip low-quality target nodes
+                if qualities[j] < EDGE_QUALITY_FLOOR {
+                    continue;
+                }
+                let emb_j = embeddings[j];
+
+                // Early-exit: cheap partial dot product on first `prefix` dims
+                if prefix > 0 {
+                    let quick_dot: f64 = emb_i[..prefix]
+                        .iter()
+                        .zip(&emb_j[..prefix])
+                        .map(|(a, b)| (*a as f64) * (*b as f64))
+                        .sum();
+                    if quick_dot < early_exit_bound {
+                        continue;
+                    }
+                }
+
+                let sim = cosine_similarity(emb_i, emb_j);
+                if sim >= threshold {
+                    self.edges.push(GraphEdge {
+                        source: memories[i].id,
+                        target: memories[j].id,
+                        weight: sim,
+                    });
+                }
+            }
+        }
+
+        tracing::info!(
+            nodes = self.nodes.len(),
+            edges = self.edges.len(),
+            "Graph rebuilt from batch (ADR-149 P3)"
+        );
+    }
+
     /// Add a memory as a graph node, creating edges to similar nodes
     pub fn add_memory(&mut self, memory: &BrainMemory) {
+        let quality = memory.quality_score.mean();
         let new_node = GraphNode {
             embedding: memory.embedding.clone(),
             category: memory.category.clone(),
+            quality,
         };
+
+        // ADR-149 P2: quality floor for edge building — skip low-quality nodes
+        // to reduce noisy edges and speed up graph operations.
+        const EDGE_QUALITY_FLOOR: f64 = 0.01;
 
         // Compute edges to existing nodes
         let mut new_edges = Vec::new();
         for (existing_id, existing_node) in &self.nodes {
+            // Skip low-quality neighbors when building edges
+            if existing_node.quality < EDGE_QUALITY_FLOOR {
+                continue;
+            }
             let sim = cosine_similarity(&new_node.embedding, &existing_node.embedding);
             if sim >= self.similarity_threshold {
                 new_edges.push(GraphEdge {
@@ -736,15 +858,73 @@ impl Default for KnowledgeGraph {
     }
 }
 
+/// L2-normalize an embedding in place. Safe to call repeatedly (idempotent
+/// within float precision).
+#[inline]
+pub fn normalize_embedding(emb: &mut [f32]) {
+    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-10 {
+        let inv = 1.0 / norm;
+        for x in emb.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
+/// Fast cosine when BOTH vectors are pre-normalized to unit length.
+/// This is just a dot product — ~3x faster than full cosine.
+#[inline]
+pub fn cosine_similarity_normalized(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let n = a.len();
+    let chunks = n / 4;
+    let (mut d0, mut d1) = (0.0f64, 0.0f64);
+    for c in 0..chunks {
+        let i = c * 4;
+        d0 += (a[i] as f64) * (b[i] as f64) + (a[i+2] as f64) * (b[i+2] as f64);
+        d1 += (a[i+1] as f64) * (b[i+1] as f64) + (a[i+3] as f64) * (b[i+3] as f64);
+    }
+    let mut sum = d0 + d1;
+    for i in (chunks * 4)..n {
+        sum += (a[i] as f64) * (b[i] as f64);
+    }
+    sum
+}
+
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
-    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
-    let norm_a: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    let norm_b: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    if norm_a < 1e-10 || norm_b < 1e-10 {
-        return 0.0;
+    // 4x unrolled dot product — compiler auto-vectorizes to SSE/AVX on x86,
+    // NEON on ARM. Avoids ruvector-core::simd_intrinsics which is stripped
+    // in the Docker build for cross-compilation compatibility.
+    let n = a.len();
+    let chunks = n / 4;
+    let (mut dot0, mut dot1) = (0.0f64, 0.0f64);
+    let (mut na0, mut na1) = (0.0f64, 0.0f64);
+    let (mut nb0, mut nb1) = (0.0f64, 0.0f64);
+    for c in 0..chunks {
+        let i = c * 4;
+        let (a0, a1, a2, a3) = (a[i] as f64, a[i+1] as f64, a[i+2] as f64, a[i+3] as f64);
+        let (b0, b1, b2, b3) = (b[i] as f64, b[i+1] as f64, b[i+2] as f64, b[i+3] as f64);
+        dot0 += a0 * b0 + a2 * b2;
+        dot1 += a1 * b1 + a3 * b3;
+        na0 += a0 * a0 + a2 * a2;
+        na1 += a1 * a1 + a3 * a3;
+        nb0 += b0 * b0 + b2 * b2;
+        nb1 += b1 * b1 + b3 * b3;
     }
+    for i in (chunks * 4)..n {
+        let (ai, bi) = (a[i] as f64, b[i] as f64);
+        dot0 += ai * bi;
+        na0 += ai * ai;
+        nb0 += bi * bi;
+    }
+    let dot = dot0 + dot1;
+    let norm_a = (na0 + na1).sqrt();
+    let norm_b = (nb0 + nb1).sqrt();
+    if norm_a < 1e-10 || norm_b < 1e-10 { return 0.0; }
     dot / (norm_a * norm_b)
 }
